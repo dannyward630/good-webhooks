@@ -5,6 +5,7 @@ import { StringDecoder } from 'node:string_decoder'
 import { checkServerIdentity } from 'node:tls'
 import { WebhookError } from './errors.js'
 import { VERSION } from './version.js'
+import { TRANSPORT_HEADER_NAMES } from './management/headers.js'
 import {
   DnsResolutionError,
   resolveTarget,
@@ -43,23 +44,12 @@ function requestHeaders(
   target: Target,
   body: string,
 ): Record<string, string> {
-  const result: Record<string, string> = {}
-  const reserved = new Set([
-    'host',
-    'content-length',
-    'transfer-encoding',
-    'connection',
-    'upgrade',
-    'expect',
-    'proxy-authorization',
-    'proxy-connection',
-    'trailer',
-    'te',
-  ])
+  // No prototype, so a header named __proto__ is stored rather than hitting the setter.
+  const result: Record<string, string> = Object.create(null)
   for (const [name, value] of Object.entries(headers)) {
     const normalized = name.toLowerCase()
     if (
-      reserved.has(normalized) ||
+      TRANSPORT_HEADER_NAMES.has(normalized) ||
       Object.hasOwn(result, normalized) ||
       typeof value !== 'string'
     ) {
