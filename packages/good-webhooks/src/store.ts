@@ -8,6 +8,8 @@ import type {
   Delivery,
   DeliveryDetail,
   DeliveryQuery,
+  DeliveryStats,
+  DeliveryStatus,
   JsonValue,
   Page,
   PublishOptions,
@@ -440,6 +442,44 @@ export function createStore(config: ResolvedConfig) {
     })
   }
 
+  /** Two reads, one per table, without a transaction. Cost grows with the scope's retained history. */
+  async function stats(scopeKey: string): Promise<DeliveryStats> {
+    scope(scopeKey)
+    // Counts read the (scope_key,endpoint_id,status,id) index, or the table when the scope holds
+    // most rows. The oldest pending row comes from the pending-only index or the endpoint index,
+    // by the planner's choice. The age uses the database clock, like created_at itself.
+    const deliveries = await config.database.query<{
+      status: DeliveryStatus
+      count: number
+      oldest_pending_age_ms: number | null
+    }>(
+      `SELECT d.status,count(*)::integer AS count,
+        (SELECT floor(extract(epoch FROM statement_timestamp()-min(p.created_at))*1000)::float8
+          FROM ${tables.deliveries} p WHERE p.scope_key=$1 AND p.status='pending') AS oldest_pending_age_ms
+      FROM ${tables.deliveries} d WHERE d.scope_key=$1 GROUP BY d.status`,
+      [scopeKey],
+    )
+    // There is no index on started_at, so the planner reads the scope's attempts through the
+    // deliveries index or hash-joins the whole attempts table when that is cheaper.
+    const attempts = await config.database.query<{ outcome: Attempt['outcome']; count: number }>(
+      `SELECT a.outcome,count(*)::integer AS count FROM ${tables.deliveries} d
+      JOIN ${tables.attempts} a ON a.delivery_id=d.id
+      WHERE d.scope_key=$1 AND a.started_at>=statement_timestamp()-interval '1 hour'
+      GROUP BY a.outcome`,
+      [scopeKey],
+    )
+    const age = deliveries.rows[0]?.oldest_pending_age_ms ?? null
+    const result: DeliveryStats = {
+      deliveries: { pending: 0, in_flight: 0, succeeded: 0, failed: 0, cancelled: 0 },
+      // A row committed between this statement's start and its snapshot can be microseconds newer.
+      oldestPendingAgeMs: age === null ? null : Math.max(0, age),
+      attemptsLastHour: { started: 0, succeeded: 0, retry: 0, failed: 0, abandoned: 0 },
+    }
+    for (const row of deliveries.rows) result.deliveries[row.status] = row.count
+    for (const row of attempts.rows) result.attemptsLastHour[row.outcome] = row.count
+    return result
+  }
+
   async function getEndpointDeliveryOptions(
     scopeKey: string,
     id: string,
@@ -483,6 +523,7 @@ export function createStore(config: ResolvedConfig) {
     getDelivery,
     replay,
     replayMany,
+    stats,
     getEndpointDeliveryOptions,
     setEndpointDeliveryOptions,
   }
